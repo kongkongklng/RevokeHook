@@ -414,12 +414,12 @@ static int FindZeroArgIndex(PCONTEXT ctx, int start_idx, int end_idx)
         if (val != 0 && (val & 0xFFFFFFFF) == 0)
             return i;
     }
-    // Pass 3: low byte == 0, but not a valid user-mode pointer
+    // Pass 3: low byte == 0, and is a valid user-mode pointer
     for (int i = start_idx; i <= end_idx; i++)
     {
         uint64_t val = GetArgValue(ctx, i);
         if (val != 0 && (val & 0xFF) == 0 &&
-            !(val >= 0x10000 && val <= 0x00007FFFFFFFFFFF))
+            (val >= 0x10000 && val <= 0x00007FFFFFFFFFFF))
             return i;
     }
     return -1;
