@@ -498,7 +498,7 @@ static int FindZeroArgIndex(ucontext_t *ctx, int start_idx, int end_idx) {
     for (int i = start_idx; i <= end_idx; i++) {
         uint64_t val = GetArgValue(ctx, i);
         if (val != 0 && (val & 0xFF) == 0 &&
-            !(val >= 0x10000 && val <= 0x00007FFFFFFFFFFF))
+            (val >= 0x10000 && val <= 0x00007FFFFFFFFFFF))
             return i;
     }
     return -1;
