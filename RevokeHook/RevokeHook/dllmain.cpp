@@ -1043,30 +1043,30 @@ static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD /*pExc*/)
         else
         {
             // 提取发送者用户名: 从文本开头到 "撤回" 之前
-            // 格式: "用户名撤回了一条消息" 或 "你撤回了一条消息"
-            int64_t name_len = revoke_pos;
-
-            // 处理 "(用户名)" 格式的前缀
+            // 微信原始格式: "用户名" 撤回了一条消息  需要去掉引号和多余空格
             int64_t name_start = 0;
-            if (name_len > 0)
+            int64_t name_end = revoke_pos;
+
+            // 跳过开头的引号和空格
+            while (name_start < name_end)
             {
-                // 跳过可能的 '(' 前缀
-                if (*(uint8_t*)(revoke_xml_str_addr) == '(')
-                {
-                    name_start = 1;
-                    // 查找对应的 ')'
-                    for (int64_t j = 1; j < name_len; j++)
-                    {
-                        if (*(uint8_t*)(revoke_xml_str_addr + j) == ')')
-                        {
-                            name_start = j + 1;
-                            break;
-                        }
-                    }
-                }
+                uint8_t c = *(uint8_t*)(revoke_xml_str_addr + name_start);
+                if (c == '"' || c == '\'' || c == ' ' || c == '\t')
+                    name_start++;
+                else
+                    break;
+            }
+            // 从尾部去掉引号和空格
+            while (name_end > name_start)
+            {
+                uint8_t c = *(uint8_t*)(revoke_xml_str_addr + name_end - 1);
+                if (c == '"' || c == '\'' || c == ' ' || c == '\t')
+                    name_end--;
+                else
+                    break;
             }
 
-            int64_t actual_name_len = name_len - name_start;
+            int64_t actual_name_len = name_end - name_start;
             const char* sender_name = (const char*)(revoke_xml_str_addr + name_start);
 
             // 计算发送者哈希用于计数
