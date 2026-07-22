@@ -153,6 +153,10 @@ struct ThreadState
 {
     uint8_t last_org_srvid[8];      //真实的srvid 防止插入两条撤回提醒
     uint8_t anti_revoke_cur_msg;    //是否防撤回当前这条消息
+    // 撤回提醒追踪
+    uint8_t last_sender_hash[8];    // 上一个撤回者的MD5(用于计数去重)
+    int revoke_count;               // 连续撤回计数
+    DWORD last_revoke_tick;         // 上次撤回时间(GetTickCount)
 };
 
 static ThreadState* GetThreadState()
@@ -1005,16 +1009,151 @@ static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD /*pExc*/)
             ((uint8_t*)mem_srvid_addr)[0], ((uint8_t*)mem_srvid_addr)[1]);
         memcpy((void*)mem_srvid_addr, rand_srvid.data(), rand_srvid.size());
 
-        uint8_t anchor[] = { 0xe4, 0xb8, 0x80, 0xe6, 0x9d, 0xa1 }; //'一条' utf-8
-        for (int64_t i = 0; i <= (int64_t)revoke_xml_ps.size - (int64_t)sizeof(anchor); i++)
+        // ── 撤回提醒: 提取用户名 + 连续撤回计数 ──
+        uint8_t revoke_utf8[] = { 0xe6, 0x92, 0xa4, 0xe5, 0x9b, 0x9e }; // '撤回'
+        uint8_t anchor[] = { 0xe4, 0xb8, 0x80, 0xe6, 0x9d, 0xa1 };       // '一条'
+        uint8_t as_above[] = { 0xe5, 0xa6, 0x82, 0xe4, 0xb8, 0x8a };     // '如上'
+
+        int64_t revoke_pos = -1;
+        int64_t anchor_pos = -1;
+
+        // 定位 "撤回" 和 "一条" 在文本中的位置
+        for (int64_t i = 0; i <= (int64_t)revoke_xml_ps.size - 6; i++)
         {
-            if (memcmp((void*)(revoke_xml_str_addr + i), anchor, sizeof(anchor)) == 0)
+            if (revoke_pos < 0 && memcmp((void*)(revoke_xml_str_addr + i), revoke_utf8, sizeof(revoke_utf8)) == 0)
+                revoke_pos = i;
+            if (anchor_pos < 0 && memcmp((void*)(revoke_xml_str_addr + i), anchor, sizeof(anchor)) == 0)
+                anchor_pos = i;
+            if (revoke_pos >= 0 && anchor_pos >= 0) break;
+        }
+
+        if (anchor_pos < 0)
+        {
+            OutputDebugPrintf("[Debug] Add2DB: anchor '一条' not found in revoke_xml");
+            // 回退: 至少尝试替换
+            anchor_pos = 0;
+        }
+        if (revoke_pos < 0)
+        {
+            OutputDebugPrintf("[Debug] Add2DB: '撤回' not found, using basic replace only");
+            // 仅替换 "一条" → "如上"
+            if (anchor_pos >= 0)
+                memcpy((void*)(revoke_xml_str_addr + anchor_pos), as_above, sizeof(as_above));
+        }
+        else
+        {
+            // 提取发送者用户名: 从文本开头到 "撤回" 之前
+            // 格式: "用户名撤回了一条消息" 或 "你撤回了一条消息"
+            int64_t name_len = revoke_pos;
+
+            // 处理 "(用户名)" 格式的前缀
+            int64_t name_start = 0;
+            if (name_len > 0)
             {
-                uint8_t replace[] = { 0xe5, 0xa6, 0x82, 0xe4, 0xb8, 0x8a }; //'如上' utf-8
-                memcpy((void*)(revoke_xml_str_addr + i), replace, sizeof(replace));
-                OutputDebugPrintf("[Debug] Replace Revoke XML Success! | New XML: %s",
-                    (char*)revoke_xml_str_addr);
-                break;
+                // 跳过可能的 '(' 前缀
+                if (*(uint8_t*)(revoke_xml_str_addr) == '(')
+                {
+                    name_start = 1;
+                    // 查找对应的 ')'
+                    for (int64_t j = 1; j < name_len; j++)
+                    {
+                        if (*(uint8_t*)(revoke_xml_str_addr + j) == ')')
+                        {
+                            name_start = j + 1;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            int64_t actual_name_len = name_len - name_start;
+            const char* sender_name = (const char*)(revoke_xml_str_addr + name_start);
+
+            // 计算发送者哈希用于计数
+            std::vector<uint8_t> name_bytes(sender_name, sender_name + actual_name_len);
+            std::vector<uint8_t> sender_hash = CalculateMD5(name_bytes);
+
+            // 连续撤回计数 (5秒超时窗口)
+            DWORD now_tick = GetTickCount();
+            bool same_sender = (sender_hash.size() == 8 &&
+                memcmp(thread_state->last_sender_hash, sender_hash.data(), 8) == 0);
+            bool within_window = (now_tick - thread_state->last_revoke_tick) < 5000;
+
+            if (same_sender && within_window && thread_state->revoke_count > 0)
+                thread_state->revoke_count++;
+            else
+                thread_state->revoke_count = 1;
+
+            if (sender_hash.size() == 8)
+                memcpy(thread_state->last_sender_hash, sender_hash.data(), 8);
+            thread_state->last_revoke_tick = now_tick;
+
+            // 构造新文本: "(用户名) 撤回如上 (N)条消息"
+            // 获取 StdString capacity
+            uint64_t capacity = revoke_xml_ps.size + 256; // 默认乐观估计
+            if (g_config_info.add2db_info.string_layout == PROGRAM_STRING_MSVC)
+            {
+                // MSVC layout: *(uint64_t*)(addr + 24) = capacity
+                if (IsMemoryReadable((void*)(revoke_xml_addr + 24), 8))
+                    capacity = *(uint64_t*)(revoke_xml_addr + 24);
+            }
+
+            // UTF-8: \xe6\x92\xa4\xe5\x9b\x9e=撤回 \xe5\xa6\x82\xe4\xb8\x8a=如上
+            //        \xe6\x9d\xa1\xe6\xb6\x88\xe6\x81\xaf=条消息
+            char new_text[512];
+            int new_len = 0;
+            new_len = snprintf(new_text, sizeof(new_text),
+                "%.*s\xe6\x92\xa4\xe5\x9b\x9e\xe5\xa6\x82\xe4\xb8\x8a%d\xe6\x9d\xa1\xe6\xb6\x88\xe6\x81\xaf",
+                (int)actual_name_len, sender_name, thread_state->revoke_count);
+
+            // 安全检查: 确保不超出 capacity
+            if (new_len > 0 && (uint64_t)new_len <= capacity + 64)
+            {
+                size_t write_len = (size_t)new_len;
+                if (write_len > (size_t)revoke_xml_ps.size + 256)
+                    write_len = (size_t)revoke_xml_ps.size + 256;
+
+                // 将新文本写入字符串缓冲区
+                memcpy((void*)revoke_xml_str_addr, new_text, write_len);
+                // 更新 StdString 的 size 字段
+                if (g_config_info.add2db_info.string_layout == PROGRAM_STRING_MSVC)
+                {
+                    if (IsMemoryReadable((void*)(revoke_xml_addr + 16), 8))
+                        *(uint64_t*)(revoke_xml_addr + 16) = write_len;
+                }
+                else
+                {
+                    if (IsMemoryReadable((void*)(revoke_xml_addr), 8))
+                        *(uint64_t*)(revoke_xml_addr) = write_len;
+                }
+
+                OutputDebugPrintf("[Debug] Revoke notify: count=%d, sender=%.*s, text=%s",
+                    thread_state->revoke_count, (int)actual_name_len, sender_name, new_text);
+                LogPrintf("[RevokeHook] Revoke #%d by '%.*s'",
+                    thread_state->revoke_count, (int)actual_name_len, sender_name);
+            }
+            else
+            {
+                // capacity 不足, 回退到简单替换
+                if (anchor_pos >= 0)
+                {
+                    memcpy((void*)(revoke_xml_str_addr + anchor_pos), as_above, sizeof(as_above));
+                    // 尝试在末尾追加用户名提示
+                    int suffix_len = snprintf(new_text, sizeof(new_text),
+                        " (%.*s)", (int)actual_name_len, sender_name);
+                    uint64_t end_pos = (uint64_t)revoke_xml_ps.size;
+                    if (suffix_len > 0 && end_pos + suffix_len <= capacity)
+                    {
+                        memcpy((void*)(revoke_xml_str_addr + end_pos), new_text, suffix_len);
+                        if (g_config_info.add2db_info.string_layout == PROGRAM_STRING_MSVC)
+                        {
+                            if (IsMemoryReadable((void*)(revoke_xml_addr + 16), 8))
+                                *(uint64_t*)(revoke_xml_addr + 16) = revoke_xml_ps.size + suffix_len;
+                        }
+                    }
+                }
+                OutputDebugPrintf("[Debug] Fallback replace (capacity insufficient, need=%d, cap=%llu)",
+                    new_len, capacity);
             }
         }
 
